@@ -20,25 +20,52 @@
 
 from __future__ import annotations
 
+import asyncio
+import calendar
+import io
+import json
 import logging
 import os
 import sqlite3
 import tempfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
-from telegram import Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+
+# Опциональные зависимости (могут быть недоступны, если не установлены).
+try:
+    from anthropic import Anthropic
+except ImportError:  # pragma: no cover
+    Anthropic = None  # type: ignore
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover
+    PdfReader = None  # type: ignore
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+except ImportError:  # pragma: no cover
+    Workbook = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Настройки и логирование
@@ -55,6 +82,20 @@ OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0")) or None
 
 # Период автобэкапа (в днях). По умолчанию — 7. Можно переопределить переменной.
 BACKUP_INTERVAL_DAYS = int(os.environ.get("BACKUP_INTERVAL_DAYS", "7"))
+
+# Anthropic Claude API. Если ключ не задан — естественный язык и чтение PDF
+# работать не будут, но штатные команды по-прежнему работают.
+# Ключ берётся со страницы https://console.anthropic.com/
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# Модель для парсинга. Haiku 4.5 — самая дешёвая и быстрая.
+# Цены: $1/$5 за миллион входных/выходных токенов.
+# Источник: https://www.anthropic.com/pricing
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+# Месячный отчёт: бот сам присылает .xlsx в каждый чат, где есть данные.
+# По умолчанию — в последний день месяца в 21:00 по часовому поясу системы.
+MONTHLY_REPORT_DAY = int(os.environ.get("MONTHLY_REPORT_DAY", "28"))  # 28 — безопасно для всех месяцев
+MONTHLY_REPORT_HOUR = int(os.environ.get("MONTHLY_REPORT_HOUR", "21"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -244,26 +285,158 @@ def fnum(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ")
 
 
+def parse_money(s: str | None) -> float:
+    """
+    Парсит сумму. Принимает и точку, и запятую как разделитель дробной части
+    (русскоязычная запись типа '324487,98' тоже работает). Игнорирует пробелы.
+    Поднимает ValueError, если строка не похожа на число.
+    """
+    if s is None or str(s).strip() == "":
+        raise ValueError("пустое значение")
+    return float(str(s).replace(" ", "").replace(",", "."))
+
+
+# ---------------------------------------------------------------------------
+# Claude API: естественный язык и чтение договоров
+# ---------------------------------------------------------------------------
+
+# Системный промпт для парсинга свободного ввода в структурированное действие.
+LLM_SYSTEM_PROMPT = """\
+Ты — парсер команд семейного финансового бота. Получаешь сообщение пользователя
+на русском и возвращаешь СТРОГО JSON одного из видов:
+
+{"action":"add_income","source":"...","amount":<число>,"is_monthly":<0|1>,"notes":"..."}
+{"action":"add_expense","category":"...","amount":<число>,"is_monthly":<0|1>,"notes":"..."}
+{"action":"add_debt","creditor":"...","principal":<число>,"rate":<число>,"payment":<число>,"term":<целое|null>,"notes":"..."}
+{"action":"add_goal","name":"...","target":<число>,"saved":<число>,"deadline":"YYYY-MM-DD|null","notes":"..."}
+{"action":"balance"}
+{"action":"analyze"}
+{"action":"distribute","amount":<число>}
+{"action":"none","reason":"..."}
+
+Правила:
+- Все числа — десятичные, без пробелов, точкой как разделитель.
+- "rate" — годовая процентная ставка в процентах.
+- "term" — срок в МЕСЯЦАХ. Если в тексте «4 года» → 48.
+- Поля, которые пользователь не указал, опускай (кроме action).
+- Если непонятно, что делать — верни {"action":"none","reason":"..."}.
+- Никакого текста кроме JSON. Никаких markdown-блоков ```json.
+"""
+
+# Системный промпт для извлечения параметров из договора кредита.
+LLM_CONTRACT_PROMPT = """\
+Ты разбираешь текст российского кредитного договора. Верни СТРОГО JSON:
+
+{"creditor":"<название банка/организации>",
+ "principal":<сумма_остатка_или_изначальная_сумма_кредита>,
+ "rate":<годовая_ставка_в_процентах>,
+ "payment":<ежемесячный_платёж>,
+ "term":<срок_в_месяцах_или_null>,
+ "notes":"<короткая характеристика, например: ипотека/потребкредит/кредитная карта>",
+ "confidence":<0..1>}
+
+Требования:
+- Все суммы — числами, без пробелов, точкой как разделитель.
+- "confidence" — твоя уверенность (0..1) в извлечении ключевых полей.
+- Если поля нет в тексте — поставь null.
+- Никакого текста кроме JSON.
+"""
+
+
+def llm_available() -> bool:
+    return bool(ANTHROPIC_API_KEY) and Anthropic is not None
+
+
+_anthropic_client: Any = None
+
+
+def get_anthropic_client():
+    """Ленивая инициализация клиента Claude."""
+    global _anthropic_client
+    if _anthropic_client is None and llm_available():
+        _anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+def _strip_json_block(text: str) -> str:
+    """Убирает обёртку ```json ... ```, если LLM её всё-таки вернёт."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        # Уберём префикс «json\n» если есть
+        if t.lower().startswith("json"):
+            t = t[4:]
+        t = t.strip()
+        # Заключительные тройные кавычки уже убрали через strip("`")
+    return t
+
+
+async def llm_call(system: str, user: str, max_tokens: int = 600) -> str:
+    """
+    Вызов Claude API в отдельном потоке (SDK синхронный, чтобы не блокировать
+    цикл событий бота). Возвращает текст ответа модели.
+    """
+    if not llm_available():
+        raise RuntimeError("ANTHROPIC_API_KEY не задан — LLM недоступен.")
+    client = get_anthropic_client()
+
+    def _sync():
+        msg = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        # SDK возвращает content как список блоков; берём текстовый.
+        return "".join(
+            block.text for block in msg.content if getattr(block, "type", None) == "text"
+        )
+
+    return await asyncio.to_thread(_sync)
+
+
+async def llm_parse_intent(user_text: str) -> dict:
+    """Свободный текст → структурированное действие (dict)."""
+    raw = await llm_call(LLM_SYSTEM_PROMPT, user_text, max_tokens=400)
+    raw = _strip_json_block(raw)
+    return json.loads(raw)
+
+
+async def llm_parse_contract(contract_text: str) -> dict:
+    """Текст договора → словарь с параметрами кредита."""
+    # Контракты бывают длинные; обрезаем до ~50K символов, чтобы уложиться в лимиты.
+    snippet = contract_text[:50000]
+    raw = await llm_call(LLM_CONTRACT_PROMPT, snippet, max_tokens=400)
+    raw = _strip_json_block(raw)
+    return json.loads(raw)
+
+
 # ---------------------------------------------------------------------------
 # Хэндлеры команд
 # ---------------------------------------------------------------------------
 
 
 HELP_TEXT = (
-    "<b>Команды:</b>\n"
-    "/add_debt creditor=&lt;кому&gt; principal=&lt;остаток&gt; rate=&lt;%годовых&gt; "
-    "payment=&lt;ежемес.&gt; term=&lt;мес.&gt; notes=&quot;...&quot;\n"
-    "/list_debts — список долгов\n"
-    "/del_debt &lt;id&gt; — удалить долг\n\n"
-    "/add_income source=&lt;откуда&gt; amount=&lt;сумма&gt; monthly=1|0 notes=&quot;...&quot;\n"
-    "/add_expense category=&lt;категория&gt; amount=&lt;сумма&gt; monthly=1|0 notes=&quot;...&quot;\n"
-    "/add_goal name=&lt;цель&gt; target=&lt;сумма&gt; saved=&lt;уже накоплено&gt; deadline=YYYY-MM-DD\n\n"
-    "/balance — сводка месяца\n"
-    "/analyze — анализ ситуации\n"
-    "/distribute &lt;сумма&gt; — куда направить свободные деньги\n\n"
+    "<b>Свободный текст (если включён Claude API):</b>\n"
+    "Просто напишите боту своими словами, например:\n"
+    "• «Получила зарплату 120 000»\n"
+    "• «Кредит в Сбере, остаток 324 487,98, ставка 39,9%, плачу 13 734,41 в месяц 57 месяцев»\n"
+    "• «Куда направить 30 000 свободных»\n"
+    "Бот распарсит, покажет, что понял, и попросит подтвердить.\n\n"
+    "<b>Договоры в PDF:</b> просто отправьте файл — бот извлечёт параметры и попросит подтвердить.\n\n"
+    "<b>Команды (работают всегда):</b>\n"
+    "/add_debt creditor=&lt;кому&gt; principal=&lt;остаток&gt; rate=&lt;%&gt; payment=&lt;ежемес.&gt; term=&lt;мес.&gt;\n"
+    "/add_income source=&lt;откуда&gt; amount=&lt;сумма&gt; monthly=1|0\n"
+    "/add_expense category=&lt;категория&gt; amount=&lt;сумма&gt; monthly=1|0\n"
+    "/add_goal name=&lt;цель&gt; target=&lt;сумма&gt; saved=&lt;накоплено&gt; deadline=YYYY-MM-DD\n"
+    "/list_debts /del_debt &lt;id&gt;\n"
+    "/balance — сводка\n"
+    "/analyze — полный анализ\n"
+    "/distribute &lt;сумма&gt; — план распределения\n"
+    "/report — Excel-отчёт прямо сейчас\n\n"
     "<b>Резервные копии:</b>\n"
-    "/myid — узнать свой Telegram ID (для настройки)\n"
-    "/backup — прислать файл базы владельцу (только OWNER_TELEGRAM_ID)\n\n"
+    "/myid — Telegram ID\n"
+    "/backup — копия БД владельцу\n\n"
     "/help — эта справка"
 )
 
@@ -288,16 +461,23 @@ async def cmd_add_debt(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     args = parse_kv_args(update.message.text)
     try:
         creditor = args["creditor"]
-        principal = float(args["principal"])
+        principal = parse_money(args["principal"])
+        rate = parse_money(args["rate"]) if args.get("rate") else 0.0
+        payment = parse_money(args["payment"]) if args.get("payment") else 0.0
+        term = int(parse_money(args["term"])) if args.get("term") else None
     except KeyError:
         await update.message.reply_text(
             "Нужно как минимум: creditor=... principal=...\n"
-            "Пример: /add_debt creditor=Sberbank principal=500000 rate=18 payment=15000 term=48"
+            "Пример: /add_debt creditor=Sberbank principal=500000 rate=18 payment=15000 term=48\n"
+            "Можно с запятой: principal=324487,98"
         )
         return
-    rate = float(args.get("rate", 0))
-    payment = float(args.get("payment", 0))
-    term = int(args["term"]) if args.get("term") else None
+    except ValueError as e:
+        await update.message.reply_text(
+            f"Не понял число: {e}.\n"
+            "Используйте точку или запятую, например: principal=324487,98 rate=39,9"
+        )
+        return
     notes = args.get("notes")
 
     with db_conn() as c:
@@ -349,15 +529,19 @@ async def cmd_del_debt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Не нашёл такой долг.")
 
 
-async def cmd_add_income(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = parse_kv_args(update.message.text)
     try:
         source = args["source"]
-        amount = float(args["amount"])
+        amount = parse_money(args["amount"])
     except KeyError:
         await update.message.reply_text(
-            "Пример: /add_income source=Зарплата amount=120000 monthly=1"
+            "Пример: /add_income source=Зарплата amount=120000 monthly=1\n"
+            "Можно с запятой: amount=124500,75"
         )
+        return
+    except ValueError as e:
+        await update.message.reply_text(f"Не понял число: {e}.")
         return
     is_monthly = int(args.get("monthly", "1"))
     with db_conn() as c:
@@ -366,6 +550,19 @@ async def cmd_add_income(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             (update.effective_chat.id, source, amount, is_monthly, args.get("notes")),
         )
     await update.message.reply_text(f"Доход «{source}» {fnum(amount)} записан.")
+    # Автосовет: если появились свободные деньги — сразу предложим план
+    cid = update.effective_chat.id
+    free = total_monthly_income(cid) - total_monthly_expense(cid) - total_monthly_debt_payment(cid)
+    if free > 0:
+        await update.message.reply_text(
+            f"💡 Свободно по месячному бюджету: {fnum(free)}.\n"
+            "Сейчас покажу, куда это направить лучше всего…"
+        )
+        context.args = [str(int(free))]
+        try:
+            await cmd_distribute(update, context)
+        except Exception as e:  # noqa: BLE001
+            log.exception("auto-advice in /add_income: %s", e)
 
 
 async def cmd_add_expense(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,6 +958,534 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Естественный язык: парсинг + подтверждение через inline-кнопки
+# ---------------------------------------------------------------------------
+
+
+def _format_pending_action(action: dict) -> str:
+    """Человекочитаемое превью действия для подтверждения."""
+    a = action.get("action")
+    if a == "add_income":
+        return (
+            "💰 <b>Добавить доход</b>\n"
+            f"Источник: {action.get('source','—')}\n"
+            f"Сумма: {fnum(float(action.get('amount', 0)))}\n"
+            f"Регулярный: {'да' if action.get('is_monthly', 1) else 'разовый'}"
+            + (f"\nЗаметка: {action['notes']}" if action.get("notes") else "")
+        )
+    if a == "add_expense":
+        return (
+            "💸 <b>Добавить расход</b>\n"
+            f"Категория: {action.get('category','—')}\n"
+            f"Сумма: {fnum(float(action.get('amount', 0)))}\n"
+            f"Регулярный: {'да' if action.get('is_monthly', 1) else 'разовый'}"
+            + (f"\nЗаметка: {action['notes']}" if action.get("notes") else "")
+        )
+    if a == "add_debt":
+        term = action.get("term")
+        lines = [
+            "🏦 <b>Добавить долг</b>",
+            f"Кредитор: {action.get('creditor','—')}",
+            f"Остаток: {fnum(float(action.get('principal', 0)))}",
+            f"Ставка: {action.get('rate', 0)}% годовых",
+            f"Платёж: {fnum(float(action.get('payment', 0)))}/мес",
+        ]
+        if term:
+            lines.append(f"Срок: {term} мес.")
+        if action.get("notes"):
+            lines.append(f"Заметка: {action['notes']}")
+        return "\n".join(lines)
+    if a == "add_goal":
+        return (
+            "🎯 <b>Добавить цель</b>\n"
+            f"Название: {action.get('name','—')}\n"
+            f"Цель: {fnum(float(action.get('target', 0)))}\n"
+            f"Уже накоплено: {fnum(float(action.get('saved', 0)))}"
+            + (f"\nДедлайн: {action['deadline']}" if action.get("deadline") else "")
+        )
+    if a == "balance":
+        return "📊 Показать сводку месяца"
+    if a == "analyze":
+        return "🔍 Полный анализ ситуации"
+    if a == "distribute":
+        return f"💡 Распределить {fnum(float(action.get('amount', 0)))} по приоритетам"
+    return f"Действие: {a}"
+
+
+def _save_pending(context: ContextTypes.DEFAULT_TYPE, action: dict) -> str:
+    """Кладёт действие в chat_data под уникальным id и возвращает id."""
+    pending = context.chat_data.setdefault("_pending", {})
+    aid = uuid.uuid4().hex[:8]
+    pending[aid] = action
+    return aid
+
+
+def _pop_pending(context: ContextTypes.DEFAULT_TYPE, aid: str) -> dict | None:
+    pending = context.chat_data.get("_pending", {})
+    return pending.pop(aid, None)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик свободного текста. Если включён LLM — парсит и просит подтверждения.
+    Если LLM выключен — просит использовать команды.
+    """
+    text = update.message.text or ""
+    if text.startswith("/"):
+        return  # команды обрабатывает CommandHandler
+
+    if not llm_available():
+        await update.message.reply_text(
+            "Не понимаю свободный текст без подключённого Claude API.\n"
+            "Используйте команды (/help) или попросите администратора задать "
+            "переменную <code>ANTHROPIC_API_KEY</code> на Railway.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Сообщение «думает»
+    await update.message.chat.send_action("typing")
+    try:
+        action = await llm_parse_intent(text)
+    except json.JSONDecodeError as e:
+        await update.message.reply_text(
+            f"Не смог разобрать ответ модели как JSON: {e}.\n"
+            "Попробуйте сформулировать иначе или используйте команды (/help)."
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("LLM intent error: %s", e)
+        await update.message.reply_text(
+            "Ошибка обращения к Claude API. Подробности в логах.\n"
+            "Можно использовать команды (/help) — они работают без LLM."
+        )
+        return
+
+    if action.get("action") == "none":
+        await update.message.reply_text(
+            "Не понял, что нужно сделать. " + (action.get("reason") or "")
+            + "\nПопробуйте конкретнее или /help."
+        )
+        return
+
+    aid = _save_pending(context, action)
+    preview = _format_pending_action(action)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Сохранить", callback_data=f"do:{aid}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{aid}")],
+        ]
+    )
+    await update.message.reply_text(
+        "Я понял так:\n\n" + preview + "\n\nСохранить?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка нажатий на inline-кнопки подтверждения."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    op, _, aid = data.partition(":")
+    action = _pop_pending(context, aid)
+    if not action:
+        await q.edit_message_text("Это действие уже обработано или устарело.")
+        return
+
+    if op == "cancel":
+        await q.edit_message_text("Отменено.")
+        return
+
+    if op != "do":
+        return
+
+    cid = update.effective_chat.id
+    a = action.get("action")
+    try:
+        if a == "add_income":
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO incomes(chat_id,source,amount,is_monthly,notes) VALUES (?,?,?,?,?)",
+                    (
+                        cid,
+                        action.get("source", "—"),
+                        float(action.get("amount", 0)),
+                        int(action.get("is_monthly", 1)),
+                        action.get("notes"),
+                    ),
+                )
+            await q.edit_message_text("✅ Доход сохранён.")
+            await _maybe_offer_advice(update, context)
+            return
+        if a == "add_expense":
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO expenses(chat_id,category,amount,is_monthly,notes) VALUES (?,?,?,?,?)",
+                    (
+                        cid,
+                        action.get("category", "—"),
+                        float(action.get("amount", 0)),
+                        int(action.get("is_monthly", 1)),
+                        action.get("notes"),
+                    ),
+                )
+            await q.edit_message_text("✅ Расход сохранён.")
+            return
+        if a == "add_debt":
+            term = action.get("term")
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO debts(chat_id,creditor,principal,annual_rate_pct,"
+                    "monthly_payment,term_months,notes) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        cid,
+                        action.get("creditor", "—"),
+                        float(action.get("principal", 0)),
+                        float(action.get("rate", 0)),
+                        float(action.get("payment", 0)),
+                        int(term) if term else None,
+                        action.get("notes"),
+                    ),
+                )
+            await q.edit_message_text("✅ Долг сохранён.")
+            return
+        if a == "add_goal":
+            with db_conn() as c:
+                c.execute(
+                    "INSERT INTO goals(chat_id,name,target,saved,deadline,notes) VALUES (?,?,?,?,?,?)",
+                    (
+                        cid,
+                        action.get("name", "—"),
+                        float(action.get("target", 0)),
+                        float(action.get("saved", 0)),
+                        action.get("deadline"),
+                        action.get("notes"),
+                    ),
+                )
+            await q.edit_message_text("✅ Цель сохранена.")
+            return
+        if a == "balance":
+            await q.edit_message_text("Запускаю /balance…")
+            await cmd_balance(update, context)
+            return
+        if a == "analyze":
+            await q.edit_message_text("Запускаю /analyze…")
+            await cmd_analyze(update, context)
+            return
+        if a == "distribute":
+            context.args = [str(action.get("amount", 0))]
+            await q.edit_message_text("Считаю распределение…")
+            await cmd_distribute(update, context)
+            return
+        await q.edit_message_text(f"Неизвестное действие: {a}")
+    except Exception as e:  # noqa: BLE001
+        log.exception("callback execute error: %s", e)
+        await q.edit_message_text(f"Ошибка при сохранении: {e}")
+
+
+async def _maybe_offer_advice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Автосовет после сохранения дохода через свободный текст. Если свободные
+    деньги по месячному бюджету > 0 — бот сам показывает план распределения.
+    """
+    cid = update.effective_chat.id
+    free = total_monthly_income(cid) - total_monthly_expense(cid) - total_monthly_debt_payment(cid)
+    if free <= 0:
+        return
+    await context.bot.send_message(
+        chat_id=cid,
+        text=(
+            f"💡 По итогам месяца у вас свободно {fnum(free)}.\n"
+            "Сейчас покажу, куда это направить лучше всего…"
+        ),
+    )
+    context.args = [str(int(free))]
+    try:
+        await cmd_distribute(update, context)
+    except Exception as e:  # noqa: BLE001
+        log.exception("auto-advice error: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# PDF-документы: чтение договоров кредита
+# ---------------------------------------------------------------------------
+
+
+def _extract_pdf_text(file_path: Path) -> str:
+    """Извлекает текст из PDF. Для сканов (без текстового слоя) вернёт мало или ничего."""
+    if PdfReader is None:
+        raise RuntimeError("pypdf не установлен.")
+    reader = PdfReader(str(file_path))
+    parts: list[str] = []
+    for page in reader.pages:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("PDF: ошибка извлечения страницы: %s", e)
+    return "\n".join(parts).strip()
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик документов (в основном PDF-договоров).
+    Скачивает файл, извлекает текст, отдаёт LLM на парсинг параметров кредита,
+    показывает превью и просит подтверждение.
+    """
+    doc = update.message.document
+    if doc is None:
+        return
+    fname = (doc.file_name or "").lower()
+    is_pdf = fname.endswith(".pdf") or doc.mime_type == "application/pdf"
+    if not is_pdf:
+        await update.message.reply_text(
+            "Я умею читать только PDF-документы. Пришлите договор в PDF."
+        )
+        return
+    if not llm_available():
+        await update.message.reply_text(
+            "Чтение договоров требует Claude API. Установите ANTHROPIC_API_KEY."
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    # Скачиваем во временный файл
+    tmp_dir = Path(tempfile.gettempdir())
+    tmp_path = tmp_dir / f"contract_{uuid.uuid4().hex}.pdf"
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=tmp_path)
+        text = _extract_pdf_text(tmp_path)
+    except Exception as e:  # noqa: BLE001
+        log.exception("PDF download/extract error: %s", e)
+        await update.message.reply_text(f"Не удалось прочитать PDF: {e}")
+        return
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+    if len(text) < 200:
+        await update.message.reply_text(
+            "Из PDF извлеклось слишком мало текста — возможно, это скан без текстового слоя.\n"
+            "Я могу читать только PDF с текстом (не картинки). "
+            "Если у вас скан — можно прогнать его через распознавание (например, "
+            "https://www.adobe.com/acrobat/online/ocr-pdf.html ) и прислать снова."
+        )
+        return
+
+    try:
+        info = await llm_parse_contract(text)
+    except json.JSONDecodeError as e:
+        await update.message.reply_text(
+            f"Модель не вернула корректный JSON: {e}. Попробуйте позже."
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("LLM contract error: %s", e)
+        await update.message.reply_text(f"Ошибка обращения к Claude: {e}")
+        return
+
+    confidence = info.get("confidence", 0)
+    action = {
+        "action": "add_debt",
+        "creditor": info.get("creditor") or "—",
+        "principal": info.get("principal") or 0,
+        "rate": info.get("rate") or 0,
+        "payment": info.get("payment") or 0,
+        "term": info.get("term"),
+        "notes": info.get("notes") or "",
+    }
+    aid = _save_pending(context, action)
+
+    preview = _format_pending_action(action)
+    warning = ""
+    if isinstance(confidence, (int, float)) and confidence < 0.6:
+        warning = (
+            f"\n\n⚠ <b>Низкая уверенность распознавания ({confidence:.0%}).</b> "
+            "Проверьте каждое поле перед сохранением."
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Сохранить", callback_data=f"do:{aid}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{aid}")],
+        ]
+    )
+    await update.message.reply_text(
+        "Из договора получилось:\n\n" + preview + warning + "\n\nСохранить?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Месячный отчёт в Excel (.xlsx)
+# ---------------------------------------------------------------------------
+
+
+def _build_xlsx_for_chat(cid: int) -> Path:
+    """
+    Строит .xlsx с отчётом по чату. Возвращает путь к временному файлу.
+    Документация openpyxl: https://openpyxl.readthedocs.io/
+    """
+    if Workbook is None:
+        raise RuntimeError("openpyxl не установлен.")
+
+    wb = Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="305496")
+    center = Alignment(horizontal="center")
+
+    def style_header(ws, row=1):
+        for cell in ws[row]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+
+    # --- Обзор ---
+    overview = wb.active
+    overview.title = "Обзор"
+    inc = total_monthly_income(cid)
+    exp = total_monthly_expense(cid)
+    debt_pay = total_monthly_debt_payment(cid)
+    free = inc - exp - debt_pay
+    overview.append(["Показатель", "Значение"])
+    style_header(overview)
+    overview.append(["Дата отчёта", datetime.now().strftime("%Y-%m-%d %H:%M")])
+    overview.append(["Доходы (мес.)", inc])
+    overview.append(["Расходы (мес.)", exp])
+    overview.append(["Платежи по долгам (мес.)", debt_pay])
+    overview.append(["Свободно (мес.)", free])
+    overview.column_dimensions["A"].width = 32
+    overview.column_dimensions["B"].width = 18
+
+    # --- Доходы ---
+    incomes_ws = wb.create_sheet("Доходы")
+    incomes_ws.append(["id", "Источник", "Сумма", "Регулярный", "Заметка", "Создано"])
+    style_header(incomes_ws)
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT id, source, amount, is_monthly, notes, created_at "
+            "FROM incomes WHERE chat_id=? ORDER BY id", (cid,)
+        ).fetchall()
+    for r in rows:
+        incomes_ws.append(
+            [r["id"], r["source"], r["amount"], "да" if r["is_monthly"] else "разовый",
+             r["notes"] or "", r["created_at"]]
+        )
+
+    # --- Расходы ---
+    exp_ws = wb.create_sheet("Расходы")
+    exp_ws.append(["id", "Категория", "Сумма", "Регулярный", "Заметка", "Создано"])
+    style_header(exp_ws)
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT id, category, amount, is_monthly, notes, created_at "
+            "FROM expenses WHERE chat_id=? ORDER BY id", (cid,)
+        ).fetchall()
+    for r in rows:
+        exp_ws.append(
+            [r["id"], r["category"], r["amount"], "да" if r["is_monthly"] else "разовый",
+             r["notes"] or "", r["created_at"]]
+        )
+
+    # --- Долги ---
+    debts_ws = wb.create_sheet("Долги")
+    debts_ws.append(["id", "Кредитор", "Остаток", "Ставка %", "Платёж/мес", "Срок (мес.)", "Заметка"])
+    style_header(debts_ws)
+    for d in fetch_debts(cid):
+        debts_ws.append([d.id, d.creditor, d.principal, d.annual_rate_pct,
+                         d.monthly_payment, d.term_months or "", d.notes or ""])
+
+    # --- Цели ---
+    goals_ws = wb.create_sheet("Цели")
+    goals_ws.append(["id", "Название", "Цель", "Накоплено", "% выполнения", "Дедлайн", "Заметка"])
+    style_header(goals_ws)
+    for g in fetch_goals(cid):
+        target = float(g["target"]) if g["target"] else 0
+        saved = float(g["saved"]) if g["saved"] else 0
+        pct = (saved / target * 100) if target else 0
+        goals_ws.append([g["id"], g["name"], target, saved,
+                         f"{pct:.0f}%", g["deadline"] or "", g["notes"] or ""])
+
+    for ws in wb.worksheets:
+        for col in ws.columns:
+            length = max((len(str(cell.value)) for cell in col if cell.value is not None), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(40, max(12, length + 2))
+
+    out = Path(tempfile.gettempdir()) / f"family_finance_report_{cid}_{datetime.now():%Y-%m}.xlsx"
+    wb.save(out)
+    return out
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сформировать и прислать .xlsx-отчёт по требованию."""
+    cid = update.effective_chat.id
+    await update.message.chat.send_action("upload_document")
+    try:
+        path = _build_xlsx_for_chat(cid)
+    except Exception as e:  # noqa: BLE001
+        log.exception("xlsx build error: %s", e)
+        await update.message.reply_text(f"Не удалось собрать отчёт: {e}")
+        return
+    try:
+        with open(path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=cid,
+                document=f,
+                filename=path.name,
+                caption="Текущий отчёт по семейным финансам.",
+            )
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _all_chat_ids() -> list[int]:
+    """Возвращает все chat_id, по которым в БД есть данные."""
+    with db_conn() as c:
+        rows = c.execute(
+            """
+            SELECT chat_id FROM incomes
+            UNION SELECT chat_id FROM expenses
+            UNION SELECT chat_id FROM debts
+            UNION SELECT chat_id FROM goals
+            """
+        ).fetchall()
+    return [int(r["chat_id"]) for r in rows]
+
+
+async def monthly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в месяц рассылает .xlsx-отчёт во все чаты с данными."""
+    for cid in _all_chat_ids():
+        try:
+            path = _build_xlsx_for_chat(cid)
+        except Exception as e:  # noqa: BLE001
+            log.exception("monthly job xlsx error for %s: %s", cid, e)
+            continue
+        try:
+            with open(path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=cid,
+                    document=f,
+                    filename=path.name,
+                    caption=f"Месячный отчёт за {datetime.now():%B %Y}.",
+                )
+        except Exception as e:  # noqa: BLE001
+            log.exception("monthly job send error for %s: %s", cid, e)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Запуск
 # ---------------------------------------------------------------------------
 
@@ -792,6 +1517,11 @@ def main() -> None:
     app.add_handler(CommandHandler("distribute", cmd_distribute))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("report", cmd_report))
+    # Подтверждение через inline-кнопки и обработка свободного текста / PDF
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.PDF, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.COMMAND, on_unknown))
 
     # Автобэкап раз в BACKUP_INTERVAL_DAYS дней.
@@ -811,6 +1541,36 @@ def main() -> None:
         log.warning(
             "Автобэкап ВЫКЛЮЧЕН (нет OWNER_TELEGRAM_ID или JobQueue). "
             "Установите python-telegram-bot[job-queue] и задайте OWNER_TELEGRAM_ID."
+        )
+
+    # Месячный Excel-отчёт. Выбираем безопасный день (28-е) и фиксированный час.
+    # Документация: https://docs.python-telegram-bot.org/en/v21.6/telegram.ext.jobqueue.html
+    if app.job_queue is not None and Workbook is not None:
+        try:
+            app.job_queue.run_monthly(
+                monthly_report_job,
+                when=time(hour=MONTHLY_REPORT_HOUR, minute=0),
+                day=MONTHLY_REPORT_DAY,
+                name="monthly_report",
+            )
+            log.info(
+                "Месячный отчёт включён: %d-е число, %02d:00",
+                MONTHLY_REPORT_DAY, MONTHLY_REPORT_HOUR,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не удалось зарегистрировать месячный отчёт: %s", e)
+    else:
+        log.warning(
+            "Месячный отчёт ВЫКЛЮЧЕН (нет JobQueue или openpyxl). "
+            "Команда /report по-прежнему работает по запросу, если openpyxl установлен."
+        )
+
+    if llm_available():
+        log.info("LLM включён. Модель: %s", CLAUDE_MODEL)
+    else:
+        log.warning(
+            "LLM ВЫКЛЮЧЕН (нет ANTHROPIC_API_KEY или библиотеки anthropic). "
+            "Свободный текст и чтение PDF недоступны; команды работают."
         )
 
     log.info("Бот запущен. Нажмите Ctrl+C для остановки.")
