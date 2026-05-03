@@ -430,6 +430,9 @@ HELP_TEXT = (
     "/add_expense category=&lt;категория&gt; amount=&lt;сумма&gt; monthly=1|0\n"
     "/add_goal name=&lt;цель&gt; target=&lt;сумма&gt; saved=&lt;накоплено&gt; deadline=YYYY-MM-DD\n"
     "/list_debts /del_debt &lt;id&gt;\n"
+    "/list_income /del_income &lt;id&gt;\n"
+    "/list_expense /del_expense &lt;id&gt;\n"
+    "/list_goals /del_goal &lt;id&gt;\n"
     "/balance — сводка\n"
     "/analyze — полный анализ\n"
     "/distribute &lt;сумма&gt; — план распределения\n"
@@ -527,6 +530,144 @@ async def cmd_del_debt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Долг #{did} удалён.")
     else:
         await update.message.reply_text("Не нашёл такой долг.")
+
+
+async def cmd_list_income(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает все доходы с id, чтобы было видно, что удалять."""
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM incomes WHERE chat_id=? ORDER BY id",
+            (update.effective_chat.id,),
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Доходов нет.")
+        return
+    lines = ["<b>Доходы:</b>"]
+    total_monthly = 0.0
+    for r in rows:
+        mark = "регулярный" if r["is_monthly"] else "разовый"
+        if r["is_monthly"]:
+            total_monthly += float(r["amount"])
+        notes = f" — <i>{r['notes']}</i>" if r["notes"] else ""
+        lines.append(
+            f"#{r['id']} {r['source']}: {fnum(float(r['amount']))} ({mark}){notes}"
+        )
+    lines.append(f"\n<b>Регулярных в месяц: {fnum(total_monthly)}</b>")
+    lines.append("\nУдалить: <code>/del_income &lt;id&gt;</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_del_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет доход по id."""
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /del_income <id>\nПосмотреть id — /list_income"
+        )
+        return
+    try:
+        rid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом.")
+        return
+    with db_conn() as c:
+        cur = c.execute(
+            "DELETE FROM incomes WHERE id=? AND chat_id=?",
+            (rid, update.effective_chat.id),
+        )
+    if cur.rowcount:
+        await update.message.reply_text(f"Доход #{rid} удалён.")
+    else:
+        await update.message.reply_text("Не нашёл такой доход.")
+
+
+async def cmd_list_expense(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает все расходы с id."""
+    with db_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM expenses WHERE chat_id=? ORDER BY id",
+            (update.effective_chat.id,),
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Расходов нет.")
+        return
+    lines = ["<b>Расходы:</b>"]
+    total_monthly = 0.0
+    for r in rows:
+        mark = "регулярный" if r["is_monthly"] else "разовый"
+        if r["is_monthly"]:
+            total_monthly += float(r["amount"])
+        notes = f" — <i>{r['notes']}</i>" if r["notes"] else ""
+        lines.append(
+            f"#{r['id']} {r['category']}: {fnum(float(r['amount']))} ({mark}){notes}"
+        )
+    lines.append(f"\n<b>Регулярных в месяц: {fnum(total_monthly)}</b>")
+    lines.append("\nУдалить: <code>/del_expense &lt;id&gt;</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_del_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет расход по id."""
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /del_expense <id>\nПосмотреть id — /list_expense"
+        )
+        return
+    try:
+        rid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом.")
+        return
+    with db_conn() as c:
+        cur = c.execute(
+            "DELETE FROM expenses WHERE id=? AND chat_id=?",
+            (rid, update.effective_chat.id),
+        )
+    if cur.rowcount:
+        await update.message.reply_text(f"Расход #{rid} удалён.")
+    else:
+        await update.message.reply_text("Не нашёл такой расход.")
+
+
+async def cmd_list_goals(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает все цели с id."""
+    rows = fetch_goals(update.effective_chat.id)
+    if not rows:
+        await update.message.reply_text("Целей нет.")
+        return
+    lines = ["<b>Цели:</b>"]
+    for r in rows:
+        target = float(r["target"]) if r["target"] else 0
+        saved = float(r["saved"]) if r["saved"] else 0
+        pct = (saved / target * 100) if target else 0
+        dl = f", до {r['deadline']}" if r["deadline"] else ""
+        lines.append(
+            f"#{r['id']} {r['name']}: {fnum(saved)}/{fnum(target)} ({pct:.0f}%){dl}"
+        )
+    lines.append("\nУдалить: <code>/del_goal &lt;id&gt;</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_del_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет цель по id."""
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /del_goal <id>\nПосмотреть id — /list_goals"
+        )
+        return
+    try:
+        rid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом.")
+        return
+    with db_conn() as c:
+        cur = c.execute(
+            "DELETE FROM goals WHERE id=? AND chat_id=?",
+            (rid, update.effective_chat.id),
+        )
+    if cur.rowcount:
+        await update.message.reply_text(f"Цель #{rid} удалена.")
+    else:
+        await update.message.reply_text("Не нашла такую цель.")
 
 
 async def cmd_add_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1515,6 +1656,12 @@ def main() -> None:
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("distribute", cmd_distribute))
+    app.add_handler(CommandHandler("list_income", cmd_list_income))
+    app.add_handler(CommandHandler("del_income", cmd_del_income))
+    app.add_handler(CommandHandler("list_expense", cmd_list_expense))
+    app.add_handler(CommandHandler("del_expense", cmd_del_expense))
+    app.add_handler(CommandHandler("list_goals", cmd_list_goals))
+    app.add_handler(CommandHandler("del_goal", cmd_del_goal))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("report", cmd_report))
