@@ -309,6 +309,7 @@ LLM_SYSTEM_PROMPT = """\
 {"action":"add_expense","category":"...","amount":<число>,"is_monthly":<0|1>,"notes":"..."}
 {"action":"add_debt","creditor":"...","principal":<число>,"rate":<число>,"payment":<число>,"term":<целое|null>,"notes":"..."}
 {"action":"add_goal","name":"...","target":<число>,"saved":<число>,"deadline":"YYYY-MM-DD|null","notes":"..."}
+{"action":"delete_entry","kind":"income|expense|debt|goal"}
 {"action":"balance"}
 {"action":"analyze"}
 {"action":"distribute","amount":<число>}
@@ -319,6 +320,9 @@ LLM_SYSTEM_PROMPT = """\
 - "rate" — годовая процентная ставка в процентах.
 - "term" — срок в МЕСЯЦАХ. Если в тексте «4 года» → 48.
 - Поля, которые пользователь не указал, опускай (кроме action).
+- Если пользователь хочет что-то удалить/убрать («убери доход», «удали лишний расход»,
+  «удали цель», «убери долг»), верни action=delete_entry и kind по теме (income/expense/debt/goal).
+  Не пытайся сам выбрать запись — конкретную запись пользователь выберет в кнопках после.
 - Если непонятно, что делать — верни {"action":"none","reason":"..."}.
 - Никакого текста кроме JSON. Никаких markdown-блоков ```json.
 """
@@ -1209,6 +1213,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Удаление записей: показываем список с кнопками, на которые пользователь
+    # нажимает, чтобы выбрать конкретную запись для удаления.
+    if action.get("action") == "delete_entry":
+        await _show_delete_picker(update, action.get("kind", ""))
+        return
+
     aid = _save_pending(context, action)
     preview = _format_pending_action(action)
     keyboard = InlineKeyboardMarkup(
@@ -1224,22 +1234,138 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _show_delete_picker(update: Update, kind: str) -> None:
+    """
+    Показывает пользователю список записей нужного типа с inline-кнопками,
+    нажатие на которые удаляет соответствующую запись.
+    kind: 'income' | 'expense' | 'debt' | 'goal'
+    """
+    cid = update.effective_chat.id
+    if kind == "income":
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT id, source, amount, is_monthly FROM incomes WHERE chat_id=? ORDER BY id",
+                (cid,),
+            ).fetchall()
+        items = [
+            (r["id"], f"#{r['id']} {r['source']}: {fnum(float(r['amount']))}"
+             + (" (рег.)" if r["is_monthly"] else " (раз.)"))
+            for r in rows
+        ]
+        title = "💰 Какой <b>доход</b> убрать?"
+    elif kind == "expense":
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT id, category, amount, is_monthly FROM expenses WHERE chat_id=? ORDER BY id",
+                (cid,),
+            ).fetchall()
+        items = [
+            (r["id"], f"#{r['id']} {r['category']}: {fnum(float(r['amount']))}"
+             + (" (рег.)" if r["is_monthly"] else " (раз.)"))
+            for r in rows
+        ]
+        title = "💸 Какой <b>расход</b> убрать?"
+    elif kind == "debt":
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT id, creditor, principal, annual_rate_pct FROM debts WHERE chat_id=? ORDER BY id",
+                (cid,),
+            ).fetchall()
+        items = [
+            (r["id"], f"#{r['id']} {r['creditor']}: {fnum(float(r['principal']))} ({r['annual_rate_pct']:g}%)")
+            for r in rows
+        ]
+        title = "🏦 Какой <b>долг</b> убрать?"
+    elif kind == "goal":
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT id, name, target, saved FROM goals WHERE chat_id=? ORDER BY id",
+                (cid,),
+            ).fetchall()
+        items = [
+            (r["id"], f"#{r['id']} {r['name']}: {fnum(float(r['saved'] or 0))}/{fnum(float(r['target'] or 0))}")
+            for r in rows
+        ]
+        title = "🎯 Какую <b>цель</b> убрать?"
+    else:
+        await update.effective_message.reply_text(
+            "Не понял, что удалить. Уточните: доход, расход, долг или цель?"
+        )
+        return
+
+    if not items:
+        await update.effective_message.reply_text(f"Нечего удалять — записей такого типа нет.")
+        return
+
+    keyboard_rows = []
+    for entry_id, label in items:
+        keyboard_rows.append(
+            [InlineKeyboardButton(f"❌ {label}", callback_data=f"del:{kind}:{entry_id}")]
+        )
+    keyboard_rows.append([InlineKeyboardButton("Отмена", callback_data="cancel:_")])
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+    await update.effective_message.reply_text(
+        title + "\n<i>Нажмите на запись — она будет удалена сразу.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка нажатий на inline-кнопки подтверждения."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
-    op, _, aid = data.partition(":")
-    action = _pop_pending(context, aid)
-    if not action:
-        await q.edit_message_text("Это действие уже обработано или устарело.")
+
+    # Удаление записи через кнопку: формат del:<kind>:<id>
+    if data.startswith("del:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await q.edit_message_text("Ошибка: непонятный запрос на удаление.")
+            return
+        kind = parts[1]
+        try:
+            entry_id = int(parts[2])
+        except ValueError:
+            await q.edit_message_text("Ошибка: id должен быть числом.")
+            return
+        cid = update.effective_chat.id
+        table_map = {
+            "income": ("incomes", "Доход"),
+            "expense": ("expenses", "Расход"),
+            "debt": ("debts", "Долг"),
+            "goal": ("goals", "Цель"),
+        }
+        if kind not in table_map:
+            await q.edit_message_text(f"Неизвестный тип записи: {kind}")
+            return
+        table, label = table_map[kind]
+        with db_conn() as c:
+            cur = c.execute(
+                f"DELETE FROM {table} WHERE id=? AND chat_id=?",
+                (entry_id, cid),
+            )
+        if cur.rowcount:
+            await q.edit_message_text(f"✅ {label} #{entry_id} удалён.")
+        else:
+            await q.edit_message_text(f"Запись #{entry_id} не найдена (возможно, уже удалена).")
         return
 
+    # Подтверждение действия (do:<aid>) или отмена (cancel:<aid>)
+    op, _, aid = data.partition(":")
+
+    # Отмена — работает вне зависимости от pending
     if op == "cancel":
         await q.edit_message_text("Отменено.")
         return
 
     if op != "do":
+        return
+
+    action = _pop_pending(context, aid)
+    if not action:
+        await q.edit_message_text("Это действие уже обработано или устарело.")
         return
 
     cid = update.effective_chat.id
