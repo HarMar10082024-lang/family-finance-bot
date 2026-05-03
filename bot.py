@@ -617,7 +617,7 @@ async def cmd_balance(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"Платежи по долгам: {fnum(debt_pay)}\n"
         f"<b>Свободно:        {fnum(free)}</b>"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +691,7 @@ async def cmd_analyze(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "• Резерв 3–6 мес. — CFPB, "
         "https://www.consumerfinance.gov/an-essential-guide-to-building-an-emergency-fund/"
     )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -712,15 +712,15 @@ def avalanche_savings(debt: Debt, extra: float) -> float:
 async def cmd_distribute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_chat.id
     if not context.args:
-        await update.message.reply_text("Использование: /distribute <сумма>")
+        await update.effective_message.reply_text("Использование: /distribute <сумма>")
         return
     try:
         amount = float(context.args[0].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Сумма должна быть числом.")
+        await update.effective_message.reply_text("Сумма должна быть числом.")
         return
     if amount <= 0:
-        await update.message.reply_text("Сумма должна быть положительной.")
+        await update.effective_message.reply_text("Сумма должна быть положительной.")
         return
 
     inc = total_monthly_income(uid)
@@ -849,7 +849,7 @@ async def cmd_distribute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "\n<i>Оценка экономии — ориентировочная (extra × ставка). "
         "Точная выгода зависит от типа платежа (аннуитет/дифф.) и оставшегося срока кредита.</i>"
     )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
